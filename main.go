@@ -8,6 +8,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
@@ -62,7 +63,7 @@ func Main() error {
 			if di.IsDir() || !di.Type().IsRegular() {
 				continue
 			}
-			fmt.Fprintf(w, "<li><a href=\"./tail?file="+url.PathEscape(di.Name())+"\">"+url.PathEscape(di.Name())+"</a></li>\n")
+			fmt.Fprintf(w, "<li><a href=\"./tail?file="+url.PathEscape(di.Name())+"\">"+html.EscapeString(di.Name())+"</a></li>\n")
 		}
 		io.WriteString(w, `
 	</ul></p>
@@ -82,10 +83,10 @@ func Main() error {
         <script src="https://unpkg.com/htmx-ext-sse@2.2.1/sse.js"></script>
     </head>
     <body>
-        <h1>`+url.PathEscape(fn)+`</h1>
+        <h1>`+html.EscapeString(fn)+`</h1>
         <div hx-ext="sse" sse-connect="/tail-sse?wrap=pre&file=`+
 			url.QueryEscape(fn)+
-			`" sse-swap="message" hx-swap="afterend scroll:bottom">
+			`" sse-swap="message" hx-swap="afterend swap:1s">
         </div>
     </body>
 </html>`)
@@ -103,7 +104,12 @@ func Main() error {
 			http.Error(w, fmt.Sprintf("only files under %q can be tailed", root), http.StatusBadRequest)
 			return
 		}
-		tl, err := tail.TailFile(fn, tail.Config{ReOpen: true, MustExist: true, Poll: true, Follow: true, CompleteLines: true})
+		tl, err := tail.TailFile(fn, tail.Config{
+			ReOpen: true, Follow: true,
+			MustExist:     true,
+			Poll:          true,
+			CompleteLines: true,
+		})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -129,7 +135,7 @@ func Main() error {
 				return
 			case line := <-tl.Lines:
 				if wrap != "" {
-					io.WriteString(w, "data: <"+wrap+">"+line.Text+"</"+wrap+">\n\n")
+					io.WriteString(w, "data: <"+wrap+">"+html.EscapeString(line.Text)+"</"+wrap+">\n\n")
 				} else {
 					io.WriteString(w, "data: "+line.Text+"\n\n")
 				}
