@@ -6,13 +6,16 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"html"
 	"io"
 	"io/fs"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -23,7 +26,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nxadm/tail"
 	"github.com/tgulacsi/go/httpunix"
 )
 
@@ -77,13 +79,15 @@ func Main() error {
 		for _, di := range dis {
 			bn := di.Name()
 			afn := path.Join(p, bn)
+			var prefix string
 			if di.Type().IsDir() {
-				io.WriteString(w, "<li><a href=\"./?path="+url.PathEscape(afn)+"\">"+html.EscapeString(bn)+"</a></li>\n")
-			} else if !di.Type().IsRegular() {
-				continue
+				prefix = "dir"
+			} else if di.Type().IsRegular() {
+				prefix = "file"
 			} else {
-				io.WriteString(w, "<li><a href=\"./tail?file="+url.PathEscape(afn)+"\">"+html.EscapeString(bn)+"</a></li>\n")
+				continue
 			}
+			io.WriteString(w, "<li><a href=\"./"+prefix+"?path="+url.PathEscape(afn)+"\">"+html.EscapeString(bn)+"</a></li>\n")
 		}
 		io.WriteString(w, `
 	</ul></p>
@@ -91,8 +95,8 @@ func Main() error {
 </html>`)
 	})
 
-	http.HandleFunc("GET /tail", func(w http.ResponseWriter, r *http.Request) {
-		fn := path.Clean(r.URL.Query().Get("file"))
+	http.HandleFunc("GET /file", func(w http.ResponseWriter, r *http.Request) {
+		fn := path.Clean(r.URL.Query().Get("path"))
 		if fi, err := FS.(fs.StatFS).Stat(fn); err != nil {
 			slog.Error("stat", "file", fn, "error", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -115,15 +119,17 @@ func Main() error {
     </head>
     <body>
         <h1>`+html.EscapeString(fn)+`</h1>
-        <pre hx-ext="sse" sse-connect="/tail-sse?left=&right=<br>&file=`+
+        <pre hx-ext="sse" sse-connect="/tail?left=&right=`+
+			url.QueryEscape(`<br>`)+
+			`&file=`+
 			url.QueryEscape(fn)+
-			`" sse-swap="message" hx-swap="afterbegin swap:1s">
+			`" sse-swap="message" hx-swap="beforebegin swap:1s">
         </pre>
     </body>
 </html>`)
 	})
 
-	http.HandleFunc("/tail-sse", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/tail", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		left := q.Get("left")
 		right := q.Get("right")
@@ -148,18 +154,12 @@ func Main() error {
 			http.Error(w, fmt.Sprintf("only files under %q can be tailed (%q)", root, afn), http.StatusBadRequest)
 			return
 		}
-		tl, err := tail.TailFile(afn, tail.Config{
-			ReOpen: true, Follow: true,
-			MustExist:     true,
-			Poll:          true, // otherwise close/reopen fails
-			CompleteLines: true,
-		})
+		fh, err := os.Open(afn)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		defer tl.Cleanup()
-
+		defer fh.Close()
 		fl, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, fmt.Sprintf("%T, not a http.Flusher", w), http.StatusInternalServerError)
@@ -171,34 +171,90 @@ func Main() error {
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 
-		ticker := time.NewTicker(time.Second)
+		ctx := r.Context()
+		linesCh := make(chan string)
+		go tailFile(ctx, linesCh, fh)
+
+		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 		bw := bufio.NewWriter(w)
-		ctx := r.Context()
 		// Create a channel to send data
 		for {
 			select {
 			case <-ctx.Done():
 				return
 
-			case line := <-tl.Lines:
+			case line, ok := <-linesCh:
+				if !ok {
+					bw.Flush()
+					fl.Flush()
+					return
+				}
 				bw.WriteString("data: ")
 				if left == "" && right == "" {
-					bw.WriteString(line.Text)
+					bw.WriteString(line)
 				} else {
 					bw.WriteString(left)
-					bw.WriteString(html.EscapeString(line.Text))
+					bw.WriteString(html.EscapeString(line))
 					bw.WriteString(right)
 				}
 				bw.WriteString("\n\n")
 
 			case <-ticker.C:
-				bw.Flush()
-				fl.Flush()
+				if bw.Buffered() != 0 {
+					bw.Flush()
+					fl.Flush()
+				}
 			}
 		}
 	})
 
 	slog.Info("Listen", "addr", *flagAddr, "root", root)
 	return httpunix.ListenAndServe(ctx, *flagAddr, http.DefaultServeMux)
+}
+
+func tailFile(ctx context.Context, linesCh chan<- string, fh *os.File) error {
+	defer func() {
+		slog.Info("finish", "tail", fh.Name())
+		fh.Close()
+		close(linesCh)
+	}()
+	var off int64
+	var a [16384]byte
+	var start int
+	dur := time.Second
+	timer := time.NewTimer(dur)
+	for {
+		n, err := fh.ReadAt(a[start:], off)
+		slog.Info("ReadAt", "off", off, "start", start, "n", n, "error", err)
+		if n == 0 {
+			dur += time.Duration(float32(time.Second) * rand.Float32())
+			timer.Reset(dur)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				return nil
+			}
+			continue
+		}
+		dur = time.Second
+		off += int64(n)
+		p := a[:start+n]
+		for {
+			if i := bytes.IndexByte(p, '\n'); i < 0 {
+				start = copy(a[0:], p)
+				break
+			} else {
+				select {
+				case <-ctx.Done():
+					return nil
+				case linesCh <- string(p[:i]):
+					p = p[i+1:]
+				}
+			}
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+	}
 }
