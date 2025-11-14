@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"html"
 	"io"
@@ -22,11 +21,13 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
+	"github.com/peterbourgon/ff/v4"
+	"github.com/peterbourgon/ff/v4/ffhelp"
 	"github.com/tgulacsi/go/httpunix"
+	"github.com/tgulacsi/go/version"
 )
 
 func main() {
@@ -37,18 +38,52 @@ func main() {
 }
 
 func Main() error {
-	flagAddr := flag.String("listen", ":8080", "listening address")
-	flag.Parse()
-	root, err := filepath.Abs(flag.Arg(0))
-	if err != nil {
-		return err
+	FS := ff.NewFlagSet("webtail")
+	flagAddr := FS.StringLong("listen", ":8080", "listening address")
+	flagVersion := FS.Bool('V', "version", "print version and exit")
+	app := ff.Command{Name: "webtail", Flags: FS,
+		Exec: func(ctx context.Context, args []string) error {
+			root, err := os.Getwd()
+			if len(args) != 0 {
+				root, err = filepath.Abs(args[0])
+			}
+			if err != nil {
+				return err
+			}
+
+			mux := http.DefaultServeMux
+			if err := setupHandlers(mux, root); err != nil {
+				return err
+			}
+			slog.Info("Listen", "addr", *flagAddr, "root", root)
+			return httpunix.ListenAndServe(ctx, *flagAddr, mux)
+		},
 	}
-	FS := os.DirFS(root)
+
+	if err := app.Parse(os.Args[1:]); err != nil {
+		ffhelp.Command(&app).WriteTo(os.Stderr)
+		if errors.Is(err, ff.ErrHelp) {
+			return nil
+		}
+		return err
+	} else if *flagVersion {
+		fmt.Println(version.Main())
+		return nil
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	return app.Run(ctx)
+}
+
+func setupHandlers(mux *http.ServeMux, rootPath string) error {
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return err
+	}
+	FS := root.FS()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		p := path.Clean(r.URL.Query().Get("path"))
 		if fi, err := FS.(fs.StatFS).Stat(p); err != nil {
 			slog.Error("stat", "path", p, "root", root, "error", err)
@@ -95,7 +130,7 @@ func Main() error {
 </html>`)
 	})
 
-	http.HandleFunc("GET /file", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /file", func(w http.ResponseWriter, r *http.Request) {
 		fn := path.Clean(r.URL.Query().Get("path"))
 		if fi, err := FS.(fs.StatFS).Stat(fn); err != nil {
 			slog.Error("stat", "file", fn, "error", err)
@@ -129,7 +164,7 @@ func Main() error {
 </html>`)
 	})
 
-	http.HandleFunc("/tail", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/tail", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		left := q.Get("left")
 		right := q.Get("right")
@@ -145,16 +180,7 @@ func Main() error {
 		}
 
 		slog.Info("tail", "URL", r.URL, "method", r.Method, "file", fn)
-		afn, err := filepath.Abs(filepath.Join(root, filepath.FromSlash(fn)))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if !strings.HasPrefix(afn, root) {
-			http.Error(w, fmt.Sprintf("only files under %q can be tailed (%q)", root, afn), http.StatusBadRequest)
-			return
-		}
-		fh, err := os.Open(afn)
+		fh, err := root.Open(fn)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -209,8 +235,7 @@ func Main() error {
 		}
 	})
 
-	slog.Info("Listen", "addr", *flagAddr, "root", root)
-	return httpunix.ListenAndServe(ctx, *flagAddr, http.DefaultServeMux)
+	return nil
 }
 
 func tailFile(ctx context.Context, linesCh chan<- string, fh *os.File) error {

@@ -1,2 +1,6 @@
+github.com/peterbourgon/ff/v4 v4.0.0-beta.1 h1:hV8qRu3V7YfiSMsBSfPfdcznAvPQd3jI5zDddSrDoUc=
+github.com/peterbourgon/ff/v4 v4.0.0-beta.1/go.mod h1:onQJUKipvCyFmZ1rIYwFAh1BhPOvftb1uhvSI7krNLc=
 github.com/tgulacsi/go v0.27.5 h1:QyPHc9FDNDTZI4t+jm2/O+1tl04ItFJKaUgtHCq6hQ0=
 github.com/tgulacsi/go v0.27.5/go.mod h1:1gMvCLuIxKFGs38yl9//g6O/qj9nO6b9WkJy5D6VhVo=
+github.com/tgulacsi/go v0.28.7 h1:ST+fjR25oWtygTQ7lkvDlhCS+VvP+yKCujAvDZJJ4vA=
+github.com/tgulacsi/go v0.28.7/go.mod h1:E+hqfWmr0OVg3KU9qtnIoBqmdKVmEtEn79ET86muuKc=
