@@ -8,6 +8,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"html"
@@ -41,6 +44,7 @@ func Main() error {
 	FS := ff.NewFlagSet("webtail")
 	flagAddr := FS.StringLong("listen", ":8080", "listening address")
 	flagVersion := FS.Bool('V', "version", "print version and exit")
+	flagHMACKey := FS.String('k', "key", "", "base64 HMAC key")
 	app := ff.Command{Name: "webtail", Flags: FS,
 		Exec: func(ctx context.Context, args []string) error {
 			root, err := os.Getwd()
@@ -50,9 +54,15 @@ func Main() error {
 			if err != nil {
 				return err
 			}
+			var macKey []byte
+			if *flagHMACKey != "" {
+				if macKey, err = base64.StdEncoding.DecodeString(*flagHMACKey); err != nil {
+					return err
+				}
+			}
 
 			mux := http.DefaultServeMux
-			if err := setupHandlers(mux, root); err != nil {
+			if err := setupHandlers(mux, root, macKey); err != nil {
 				return err
 			}
 			slog.Info("Listen", "addr", *flagAddr, "root", root)
@@ -77,12 +87,16 @@ func Main() error {
 	return app.Run(ctx)
 }
 
-func setupHandlers(mux *http.ServeMux, rootPath string) error {
+func setupHandlers(mux *http.ServeMux, rootPath string, macKey []byte) error {
+	if len(macKey) == 0 {
+		slog.Warn("Empty macKey")
+	}
 	root, err := os.OpenRoot(rootPath)
 	if err != nil {
 		return err
 	}
 	FS := root.FS()
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		p := path.Clean(r.URL.Query().Get("path"))
 		if fi, err := FS.(fs.StatFS).Stat(p); err != nil {
@@ -111,6 +125,8 @@ func setupHandlers(mux *http.ServeMux, rootPath string) error {
 <p>
 <ul>
 `)
+		hsh := hmac.New(sha256.New, macKey)
+		var b []byte
 		for _, di := range dis {
 			bn := di.Name()
 			afn := path.Join(p, bn)
@@ -122,7 +138,10 @@ func setupHandlers(mux *http.ServeMux, rootPath string) error {
 			} else {
 				continue
 			}
-			io.WriteString(w, "<li><a href=\"./"+prefix+"?path="+url.PathEscape(afn)+"\">"+html.EscapeString(bn)+"</a></li>\n")
+			hsh.Reset()
+			io.WriteString(hsh, afn)
+			b = hsh.Sum(b[:0])
+			io.WriteString(w, "<li><a href=\"./"+prefix+"?path="+url.PathEscape(afn)+"&mac="+base64.URLEncoding.EncodeToString(b)+"\">"+html.EscapeString(bn)+"</a></li>\n")
 		}
 		io.WriteString(w, `
 	</ul></p>
@@ -132,6 +151,11 @@ func setupHandlers(mux *http.ServeMux, rootPath string) error {
 
 	mux.HandleFunc("GET /file", func(w http.ResponseWriter, r *http.Request) {
 		fn := path.Clean(r.URL.Query().Get("path"))
+		got := r.URL.Query().Get("mac")
+		if err := checkMac(macKey, fn, got); err != nil {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
 		if fi, err := FS.(fs.StatFS).Stat(fn); err != nil {
 			slog.Error("stat", "file", fn, "error", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -158,6 +182,7 @@ func setupHandlers(mux *http.ServeMux, rootPath string) error {
 			url.QueryEscape(`<br>`)+
 			`&file=`+
 			url.QueryEscape(fn)+
+			"&mac="+url.QueryEscape(got)+
 			`" sse-swap="message" hx-swap="beforebegin swap:1s">
         </pre>
     </body>
@@ -169,6 +194,10 @@ func setupHandlers(mux *http.ServeMux, rootPath string) error {
 		left := q.Get("left")
 		right := q.Get("right")
 		fn := path.Clean(q.Get("file"))
+		if err := checkMac(macKey, fn, q.Get("mac")); err != nil {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
 		if fi, err := FS.(fs.StatFS).Stat(fn); err != nil {
 			slog.Error("stat", "file", fn, "root", root, "error", err)
 			http.Error(w, err.Error(), http.StatusNotFound)
@@ -282,4 +311,25 @@ func tailFile(ctx context.Context, linesCh chan<- string, fh *os.File) error {
 			return err
 		}
 	}
+}
+
+var errHashMismatch = errors.New("hash mismatch")
+
+func checkMac(macKey []byte, s, got string) error {
+	if len(macKey) == 0 {
+		slog.Warn("empty macKey")
+		return nil
+	}
+	hsh := hmac.New(sha256.New, macKey)
+	io.WriteString(hsh, s)
+	want, err := base64.URLEncoding.DecodeString(got)
+	if err != nil {
+		slog.Error("decode", "base64", got, "error", err)
+		return fmt.Errorf("decode mac: %w", err)
+	}
+	if !hmac.Equal(hsh.Sum(nil), want) {
+		slog.Error("hash mismatch", "want", want, "got", got)
+		return errHashMismatch
+	}
+	return nil
 }
