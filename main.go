@@ -1,4 +1,4 @@
-// Copyright 2024 Tamás Gulácsi. All rights reserved.
+// Copyright 2024, 2025 Tamás Gulácsi. All rights reserved.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -29,6 +29,7 @@ import (
 
 	"github.com/peterbourgon/ff/v4"
 	"github.com/peterbourgon/ff/v4/ffhelp"
+	"github.com/tgulacsi/go/filterfs"
 	"github.com/tgulacsi/go/httpunix"
 	"github.com/tgulacsi/go/version"
 )
@@ -46,6 +47,8 @@ func Main() error {
 	flagVersion := FS.Bool('V', "version", "print version and exit")
 	flagHMACKey := FS.String('k', "key", "", "base64 HMAC key")
 	app := ff.Command{Name: "webtail", Flags: FS,
+		ShortHelp: "tail file, show on web",
+		Usage:     "webtail [opts] <log root>",
 		Exec: func(ctx context.Context, args []string) error {
 			root, err := os.Getwd()
 			if len(args) != 0 {
@@ -91,11 +94,21 @@ func setupHandlers(mux *http.ServeMux, rootPath string, macKey []byte) error {
 	if len(macKey) == 0 {
 		slog.Warn("Empty macKey")
 	}
+	var filterFS func(fs.FS) fs.FS
+	if fi, err := os.Stat(rootPath); err == nil && !fi.IsDir() {
+		rootPath = filepath.Dir(fi.Name())
+		filterFS = func(fsys fs.FS) fs.FS {
+			return filterfs.NewOneFileFS(fsys, filepath.Base(fi.Name()))
+		}
+	}
 	root, err := os.OpenRoot(rootPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("openRoot: %w", err)
 	}
 	FS := root.FS()
+	if filterFS != nil {
+		FS = filterFS(FS)
+	}
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		p := path.Clean(r.URL.Query().Get("path"))
