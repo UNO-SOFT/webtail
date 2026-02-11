@@ -21,17 +21,22 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/peterbourgon/ff/v4"
 	"github.com/peterbourgon/ff/v4/ffhelp"
 	"github.com/tgulacsi/go/filterfs"
 	"github.com/tgulacsi/go/httpunix"
 	"github.com/tgulacsi/go/version"
+	"mvdan.cc/sh/v3/syntax"
 )
 
 func main() {
@@ -42,13 +47,24 @@ func main() {
 }
 
 func Main() error {
-	FS := ff.NewFlagSet("webtail")
-	flagAddr := FS.StringLong("listen", ":8080", "listening address")
-	flagVersion := FS.Bool('V', "version", "print version and exit")
+	appFS := ff.NewFlagSet("webtail")
+	flagAddr := appFS.StringLong("listen", ":8080", "listening address")
+	flagTLSCert := appFS.StringLong("tls-cert", os.ExpandEnv("$BRUNO_HOME/../admin/ssl/crt.pem"), "TLS Certificate PEM")
+	flagTLSKey := appFS.StringLong("tls-key", os.ExpandEnv("$BRUNO_HOME/../admin/ssl/key.pem"), "TLS Key PEM")
+	serve := func(ctx context.Context, hndl http.Handler) error {
+		slog.Info("Listen", "addr", *flagAddr)
+		if addr, ok := strings.CutPrefix(*flagAddr, "https://"); ok {
+			return http.ListenAndServeTLS(addr, *flagTLSCert, *flagTLSKey, hndl)
+		}
+		return httpunix.ListenAndServe(ctx, *flagAddr, hndl)
+	}
+
+	FS := ff.NewFlagSet("serve")
 	flagHMACKey := FS.String('k', "key", "", "base64 HMAC key")
-	app := ff.Command{Name: "webtail", Flags: FS,
+
+	serveCmd := ff.Command{Name: "serve", Flags: FS,
 		ShortHelp: "tail file, show on web",
-		Usage:     "webtail [opts] <log root>",
+		Usage:     "serve [opts] <log root>",
 		Exec: func(ctx context.Context, args []string) error {
 			root, err := os.Getwd()
 			if len(args) != 0 {
@@ -65,12 +81,130 @@ func Main() error {
 			}
 
 			mux := http.DefaultServeMux
-			if err := setupHandlers(mux, root, macKey); err != nil {
+			if err := serveSetupHandlers(mux, root, macKey); err != nil {
 				return err
 			}
-			slog.Info("Listen", "addr", *flagAddr, "root", root)
-			return httpunix.ListenAndServe(ctx, *flagAddr, mux)
+			return serve(ctx, mux)
 		},
+	}
+
+	FS = ff.NewFlagSet("run")
+	flagEmails := FS.StringListLong("email", "email addresses")
+	flagGetenv := FS.StringLong("get-env", os.ExpandEnv(". ${BRUNO_HOME}/../.app_env"), "bash command to set up the environment")
+	flagAsEphemeralService := FS.BoolLong("ephemeral-service", "start as ephemeral service")
+	runCmd := ff.Command{Name: "run", Flags: FS,
+		ShortHelp: "run program and tail output on web",
+		Usage:     "run [opts] <program> [program args]",
+		Exec: func(ctx context.Context, args []string) error {
+			var prog string
+			cmdArgs := make([]string, 0, 1+8+len(args))
+			if !*flagAsEphemeralService {
+				if *flagGetenv == "" {
+					prog = args[0]
+					cmdArgs = append(cmdArgs, args[1:]...)
+				} else {
+					var buf strings.Builder
+					buf.WriteString(*flagGetenv)
+					buf.WriteString(";")
+					for _, a := range args {
+						buf.WriteByte(' ')
+						buf.WriteString(a)
+					}
+					prog = "/bin/bash"
+					cmdArgs = append(cmdArgs, "-c", buf.String())
+				}
+			} else {
+				prog = "systemd-run"
+				argsAreUTF8 := utf8.Valid([]byte(args[0]))
+				var buf bytes.Buffer
+				for _, a := range args[1:] {
+					if buf.Len() != 0 {
+						buf.WriteByte(' ')
+					}
+					s, err := syntax.Quote(a, syntax.LangBash)
+					if err != nil {
+						return fmt.Errorf("quote %s: %w", a, err)
+					}
+					buf.WriteString(s)
+					argsAreUTF8 = argsAreUTF8 && utf8.Valid([]byte(a))
+				}
+				hsh := sha256.Sum224(buf.Bytes())
+				name := (base64.StdEncoding.EncodeToString([]byte(args[0])) +
+					"-" + base64.StdEncoding.EncodeToString(hsh[:]))
+				argsB64 := base64.StdEncoding.EncodeToString(buf.Bytes())
+				var setup string
+				if *flagGetenv != "" {
+					setup = *flagGetenv + "; "
+				}
+				cmdArgs = append(cmdArgs, "systemd-run",
+					"--user", "--collect", "--pipe",
+					"--service-type=exec", "--unit="+name)
+				if setup == "" && argsAreUTF8 {
+					cmdArgs = append(cmdArgs, args...)
+				} else {
+					prog, err := syntax.Quote(args[0], syntax.LangBash)
+					if err != nil {
+						return fmt.Errorf("quote %s: %w", args[0], err)
+					}
+					cmdArgs = append(cmdArgs,
+						"/bin/bash", "-c",
+						fmt.Sprintf(
+							"%sexec %s $(echo -n '%s' | base64 -d)",
+							setup, prog, argsB64))
+				}
+			}
+
+			cmd := exec.CommandContext(context.Background(), prog, cmdArgs...)
+			slog.Info("start", "prog", cmd.Args)
+			cmd.Stderr = cmd.Stderr
+			out, err := cmd.StdoutPipe()
+			if err != nil {
+				return err
+			}
+			mux := http.DefaultServeMux
+			done := make(chan error, 1)
+			if err := runSetupHandlers(mux, out, done); err != nil {
+				return err
+			}
+			if err := cmd.Start(); err != nil {
+				return fmt.Errorf("start %q: %w", cmd.Args, err)
+			}
+			go func() {
+				defer close(done)
+				err := cmd.Wait()
+				done <- err
+				if len(*flagEmails) == 0 {
+					return
+				}
+				var typ string
+				var rc int
+				if err == nil {
+					typ = "sikeresen"
+				} else {
+					typ = "HIBAval"
+					var ee *exec.ExitError
+					if errors.As(err, &ee) {
+						rc = ee.ExitCode()
+					}
+				}
+				mail := exec.CommandContext(ctx, "mail",
+					append(append(make([]string, 0, 2+len(*flagEmails)),
+						"-s", strings.Join(args, " ")+" "+typ+" lefutott"),
+						*flagEmails...)...)
+				mail.Stdin = strings.NewReader(
+					strings.Join(cmd.Args, " ") + ": " + strconv.Itoa(rc))
+				mail.Stdout, mail.Stderr = os.Stdout, os.Stderr
+				if err := mail.Start(); err != nil {
+					slog.Error("sending mail", "cmd", mail.Args, "error", err)
+				}
+			}()
+			return serve(ctx, mux)
+		},
+	}
+
+	flagVersion := appFS.Bool('V', "version", "print version and exit")
+	app := ff.Command{Name: "webtail", Flags: appFS,
+		Subcommands: []*ff.Command{&serveCmd, &runCmd},
 	}
 
 	if err := app.Parse(os.Args[1:]); err != nil {
@@ -90,7 +224,7 @@ func Main() error {
 	return app.Run(ctx)
 }
 
-func setupHandlers(mux *http.ServeMux, rootPath string, macKey []byte) error {
+func serveSetupHandlers(mux *http.ServeMux, rootPath string, macKey []byte) error {
 	if len(macKey) == 0 {
 		slog.Warn("Empty macKey")
 	}
