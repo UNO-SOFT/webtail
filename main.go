@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
@@ -81,7 +82,7 @@ func Main() error {
 			}
 
 			mux := http.DefaultServeMux
-			if err := serveSetupHandlers(mux, root, macKey); err != nil {
+			if err := setupHandlers(mux, root, macKey); err != nil {
 				return err
 			}
 			return serve(ctx, mux)
@@ -89,6 +90,7 @@ func Main() error {
 	}
 
 	FS = ff.NewFlagSet("run")
+	flagLogFile := FS.StringLong("log-file", os.ExpandEnv("$BRUNO_HOME/data/mai/log/webtail-")+strconv.Itoa(os.Getpid())+".log", "log file")
 	flagEmails := FS.StringListLong("email", "email addresses")
 	flagGetenv := FS.StringLong("get-env", os.ExpandEnv(". ${BRUNO_HOME}/../.app_env"), "bash command to set up the environment")
 	flagAsEphemeralService := FS.BoolLong("ephemeral-service", "start as ephemeral service")
@@ -136,43 +138,67 @@ func Main() error {
 				if *flagGetenv != "" {
 					setup = *flagGetenv + "; "
 				}
-				cmdArgs = append(cmdArgs, "systemd-run",
+
+				prog = "systemd-run"
+				cmdArgs = append(cmdArgs,
 					"--user", "--collect", "--pipe",
 					"--service-type=exec", "--unit="+name)
 				if setup == "" && argsAreUTF8 {
 					cmdArgs = append(cmdArgs, args...)
 				} else {
-					prog, err := syntax.Quote(args[0], syntax.LangBash)
+					prg, err := syntax.Quote(args[0], syntax.LangBash)
 					if err != nil {
 						return fmt.Errorf("quote %s: %w", args[0], err)
 					}
 					cmdArgs = append(cmdArgs,
 						"/bin/bash", "-c",
 						fmt.Sprintf(
-							"%sexec %s $(echo -n '%s' | base64 -d)",
-							setup, prog, argsB64))
+							setup+"exec %s $(echo -n '%s' | base64 -d)",
+							prg, argsB64))
 				}
 			}
 
 			cmd := exec.CommandContext(context.Background(), prog, cmdArgs...)
-			slog.Info("start", "prog", cmd.Args)
-			cmd.Stderr = cmd.Stderr
-			out, err := cmd.StdoutPipe()
-			if err != nil {
-				return err
+			var fh *os.File
+			var err error
+			if *flagLogFile == "" {
+				fh, err = os.CreateTemp("", "webtail-"+strconv.Itoa(os.Getpid())+"-*.log")
+			} else {
+				fh, err = os.OpenFile(*flagLogFile, os.O_APPEND|os.O_CREATE, 0644)
 			}
+			if err != nil {
+				return fmt.Errorf("open log file: %w", err)
+			}
+			slog.Info("start", "prog", cmd.Args, "log", fh.Name())
+			cmd.Stdout = fh
+			cmd.Stderr = cmd.Stdout
 			mux := http.DefaultServeMux
 			done := make(chan error, 1)
-			if err := runSetupHandlers(mux, out, done); err != nil {
+			var a [8]byte
+			n, _ := crand.Read(a[:])
+			macKey := a[:n]
+			slog.Debug("setupHandlers", "file", fh.Name())
+			if err := setupHandlers(mux, fh.Name(), macKey); err != nil {
 				return err
 			}
 			if err := cmd.Start(); err != nil {
 				return fmt.Errorf("start %q: %w", cmd.Args, err)
 			}
+			hsh := hmac.New(sha256.New, macKey)
+			bn := filepath.Base(fh.Name())
+			io.WriteString(hsh, bn)
+			want := base64.URLEncoding.EncodeToString(hsh.Sum(nil))
+			addr := *flagAddr
+			if strings.HasPrefix(addr, ":") {
+				addr = "http://localhost" + addr
+			}
+			fmt.Println(addr + "/tail?left=&right=%3Cbr%3E&file=" + url.PathEscape(bn) + "&mac=" + want)
+
 			go func() {
 				defer close(done)
 				err := cmd.Wait()
 				done <- err
+				slog.Warn("finished", "error", err)
 				if len(*flagEmails) == 0 {
 					return
 				}
@@ -224,17 +250,19 @@ func Main() error {
 	return app.Run(ctx)
 }
 
-func serveSetupHandlers(mux *http.ServeMux, rootPath string, macKey []byte) error {
+func setupHandlers(mux *http.ServeMux, rootPath string, macKey []byte) error {
 	if len(macKey) == 0 {
 		slog.Warn("Empty macKey")
 	}
 	var filterFS func(fs.FS) fs.FS
 	if fi, err := os.Stat(rootPath); err == nil && !fi.IsDir() {
-		rootPath = filepath.Dir(fi.Name())
+		rootPath = filepath.Dir(rootPath)
+		slog.Info("stat non dir", "file", fi.Name(), "root", rootPath)
 		filterFS = func(fsys fs.FS) fs.FS {
 			return filterfs.NewOneFileFS(fsys, filepath.Base(fi.Name()))
 		}
 	}
+	slog.Debug("open", "root", rootPath)
 	root, err := os.OpenRoot(rootPath)
 	if err != nil {
 		return fmt.Errorf("openRoot: %w", err)
@@ -246,7 +274,7 @@ func serveSetupHandlers(mux *http.ServeMux, rootPath string, macKey []byte) erro
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		p := path.Clean(r.URL.Query().Get("path"))
-		if fi, err := FS.(fs.StatFS).Stat(p); err != nil {
+		if fi, err := fs.Stat(FS, p); err != nil {
 			slog.Error("stat", "path", p, "root", root, "error", err)
 			p = "/"
 		} else if !fi.Mode().IsDir() {
@@ -255,10 +283,13 @@ func serveSetupHandlers(mux *http.ServeMux, rootPath string, macKey []byte) erro
 		}
 
 		slog.Info("/", "path", p)
-		dis, err := FS.(fs.ReadDirFS).ReadDir(p)
-		if len(dis) == 0 && err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		dis, err := fs.ReadDir(FS, p)
+		if len(dis) == 0 {
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			slog.Warn("empty", "path", p)
 		}
 
 		w.Header().Set("Content-Type", "text/html")
@@ -303,7 +334,7 @@ func serveSetupHandlers(mux *http.ServeMux, rootPath string, macKey []byte) erro
 			http.Error(w, err.Error(), http.StatusUnauthorized)
 			return
 		}
-		if fi, err := FS.(fs.StatFS).Stat(fn); err != nil {
+		if fi, err := fs.Stat(FS, fn); err != nil {
 			slog.Error("stat", "file", fn, "error", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -345,7 +376,7 @@ func serveSetupHandlers(mux *http.ServeMux, rootPath string, macKey []byte) erro
 			http.Error(w, err.Error(), http.StatusUnauthorized)
 			return
 		}
-		if fi, err := FS.(fs.StatFS).Stat(fn); err != nil {
+		if fi, err := fs.Stat(FS, fn); err != nil {
 			slog.Error("stat", "file", fn, "root", root, "error", err)
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
