@@ -56,6 +56,15 @@ func Main() error {
 	flagAddr := appFS.StringLong("listen", ":8080", "listening address")
 	flagTLSCert := appFS.StringLong("tls-cert", os.ExpandEnv("$BRUNO_HOME/../admin/ssl/crt.pem"), "TLS Certificate PEM")
 	flagTLSKey := appFS.StringLong("tls-key", os.ExpandEnv("$BRUNO_HOME/../admin/ssl/key.pem"), "TLS Key PEM")
+	if strings.HasPrefix(*flagAddr, ":") {
+		if fi, err := os.Stat(*flagTLSCert); err == nil && fi.Size() != 0 {
+			if fi, err := os.Stat(*flagTLSKey); err == nil && fi.Size() != 0 {
+				if hostname, _ := os.Hostname(); hostname != "" {
+					*flagAddr = "https://" + hostname + *flagAddr
+				}
+			}
+		}
+	}
 	serve := func(ctx context.Context, hndl http.Handler) error {
 		slog.Info("Listen", "addr", *flagAddr)
 		if addr, ok := strings.CutPrefix(*flagAddr, "https://"); ok {
@@ -96,7 +105,6 @@ func Main() error {
 	// Ez sem jó: nem bruno alatt kéne futnia, hogy ne álljon le a szervízek leállításakor.
 	// De akkor nem ugyanaz a környezet, user stb.
 	FS = ff.NewFlagSet("service")
-	flagListen := FS.StringLong("listen", "localhost:7654", "listen address")
 	serviceCmd := ff.Command{Name: "service", Flags: FS,
 		Exec: func(ctx context.Context, args []string) error {
 			http.HandleFunc("/run", func(w http.ResponseWriter, r *http.Request) {
@@ -166,7 +174,7 @@ func Main() error {
 				}
 				io.WriteString(w, "/follow?name="+name)
 			})
-			return httpunix.ListenAndServe(ctx, *flagListen, http.DefaultServeMux)
+			return serve(ctx, http.DefaultServeMux)
 		},
 	}
 
