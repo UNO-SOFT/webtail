@@ -33,6 +33,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/go-json-experiment/json"
+	"github.com/godror/godror/cloexec"
 	"github.com/oklog/ulid/v2"
 	"github.com/peterbourgon/ff/v4"
 	"github.com/peterbourgon/ff/v4/ffhelp"
@@ -156,6 +157,9 @@ func Main() error {
 							prg, argsB64))
 				}
 				cmd := exec.CommandContext(context.Background(), prog, cmdArgs...)
+				if err := cloexec.SetNetConnections("tcp"); err != nil {
+					slog.Warn("cloexec.SetNetConnections", "error", err)
+				}
 				if err := cmd.Start(); err != nil {
 					http.Error(w, fmt.Sprintf("start %s: %w", cmd.Args, err), http.StatusInternalServerError)
 					return
@@ -228,6 +232,9 @@ func Main() error {
 					Pgid:    0,
 				}
 			}
+			if err := cloexec.SetNetConnections("tcp"); err != nil {
+				slog.Warn("cloexec.SetNetConnections", "error", err)
+			}
 			if err := cmd.Start(); err != nil {
 				return err
 			} else if !*flagWait {
@@ -291,8 +298,11 @@ func Main() error {
 			slog.Debug("go", "args", fmt.Sprintf("%q", args))
 
 			cmdArgs := append(make([]string, 0, 1+8+len(args)), "systemd-run",
-				"--user", "--collect", "--pipe",
+				"--user", "--collect",
 				"--service-type=exec", "--unit="+params.Name)
+			if params.LogFile == "" {
+				cmdArgs = append(cmdArgs, "--pipe")
+			}
 			if setup == "" && argsAreUTF8 {
 				cmdArgs = append(cmdArgs, args...)
 			} else {
@@ -309,6 +319,9 @@ func Main() error {
 			cmd := exec.CommandContext(context.Background(), cmdArgs[0], cmdArgs[1:]...)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			slog.Info("start", "prog", fmt.Sprintf("%q", cmd.Args))
+			if err := cloexec.SetNetConnections("tcp"); err != nil {
+				slog.Warn("cloexec.SetNetConnections", "error", err)
+			}
 			if err := cmd.Start(); err != nil {
 				return fmt.Errorf("start %q: %w", cmd.Args, err)
 			}
