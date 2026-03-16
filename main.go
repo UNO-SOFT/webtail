@@ -47,6 +47,7 @@ func main() {
 		slog.Error("main", "error", err)
 		os.Exit(1)
 	}
+	// slog.Info("finish")
 }
 
 func Main() error {
@@ -221,8 +222,18 @@ func Main() error {
 			cmd.Stdin = bytes.NewReader(b)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			slog.Info("send", "params", string(b))
-			if err := cmd.Start(); err != nil || !*flagWait {
+			if !*flagWait {
+				cmd.SysProcAttr = &syscall.SysProcAttr{
+					Setpgid: true,
+					Pgid:    0,
+				}
+			}
+			if err := cmd.Start(); err != nil {
 				return err
+			} else if !*flagWait {
+				time.Sleep(100 * time.Millisecond)
+				// slog.Info("return")
+				return nil
 			}
 			return cmd.Wait()
 		},
