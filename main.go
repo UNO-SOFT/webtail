@@ -1,4 +1,4 @@
-// Copyright 2024, 2025 Tamás Gulácsi. All rights reserved.
+// Copyright 2024, 2026 Tamás Gulácsi. All rights reserved.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -32,6 +32,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/go-json-experiment/json"
+	"github.com/oklog/ulid/v2"
 	"github.com/peterbourgon/ff/v4"
 	"github.com/peterbourgon/ff/v4/ffhelp"
 	"github.com/tgulacsi/go/filterfs"
@@ -89,34 +91,34 @@ func Main() error {
 		},
 	}
 
-	FS = ff.NewFlagSet("run")
-	flagLogFile := FS.StringLong("log-file", os.ExpandEnv("$BRUNO_HOME/data/mai/log/webtail-")+strconv.Itoa(os.Getpid())+".log", "log file")
-	flagEmails := FS.StringListLong("email", "email addresses")
-	flagGetenv := FS.StringLong("get-env", os.ExpandEnv(". ${BRUNO_HOME}/../.app_env"), "bash command to set up the environment")
-	flagAsEphemeralService := FS.BoolLong("ephemeral-service", "start as ephemeral service")
-	runCmd := ff.Command{Name: "run", Flags: FS,
-		ShortHelp: "run program and tail output on web",
-		Usage:     "run [opts] <program> [program args]",
+	// Ez sem jó: nem bruno alatt kéne futnia, hogy ne álljon le a szervízek leállításakor.
+	// De akkor nem ugyanaz a környezet, user stb.
+	FS = ff.NewFlagSet("service")
+	flagListen := FS.StringLong("listen", "localhost:7654", "listen address")
+	serviceCmd := ff.Command{Name: "service", Flags: FS,
 		Exec: func(ctx context.Context, args []string) error {
-			var prog string
-			cmdArgs := make([]string, 0, 1+8+len(args))
-			if !*flagAsEphemeralService {
-				if *flagGetenv == "" {
-					prog = args[0]
-					cmdArgs = append(cmdArgs, args[1:]...)
-				} else {
+			http.HandleFunc("/run", func(w http.ResponseWriter, r *http.Request) {
+				q := r.URL.Query()
+				args := append(append(make([]string, 0, 1+len(q["args"])), q.Get("program")), q["args"]...)
+				var setup string
+				{
 					var buf strings.Builder
-					buf.WriteString(*flagGetenv)
-					buf.WriteString(";")
-					for _, a := range args {
-						buf.WriteByte(' ')
-						buf.WriteString(a)
+					if getenv := q.Get("getenv"); getenv != "" {
+						buf.WriteString(getenv)
+						buf.WriteString("; ")
 					}
-					prog = "/bin/bash"
-					cmdArgs = append(cmdArgs, "-c", buf.String())
+					var sleep time.Duration
+					if s := q.Get("sleep"); s != "" {
+						var err error
+						if sleep, err = time.ParseDuration(s); err != nil {
+							http.Error(w, fmt.Sprintf("parse sleep=%s: %+v", s, err), http.StatusBadRequest)
+							return
+						} else if sleep != 0 {
+							fmt.Fprintf(&buf, "sleep %.03fs; ", float64(sleep)/float64(time.Second))
+						}
+					}
+					setup = buf.String()
 				}
-			} else {
-				prog = "systemd-run"
 				argsAreUTF8 := utf8.Valid([]byte(args[0]))
 				var buf bytes.Buffer
 				for _, a := range args[1:] {
@@ -125,67 +127,76 @@ func Main() error {
 					}
 					s, err := syntax.Quote(a, syntax.LangBash)
 					if err != nil {
-						return fmt.Errorf("quote %s: %w", a, err)
+						http.Error(w, fmt.Sprintf("quote %s: %w", a, err), http.StatusBadRequest)
+						return
 					}
 					buf.WriteString(s)
 					argsAreUTF8 = argsAreUTF8 && utf8.Valid([]byte(a))
 				}
-				hsh := sha256.Sum224(buf.Bytes())
-				name := (base64.StdEncoding.EncodeToString([]byte(args[0])) +
-					"-" + base64.StdEncoding.EncodeToString(hsh[:]))
+				name := ulid.Make().String()
 				argsB64 := base64.StdEncoding.EncodeToString(buf.Bytes())
-				var setup string
-				if *flagGetenv != "" {
-					setup = *flagGetenv + "; "
-				}
 
-				prog = "systemd-run"
-				cmdArgs = append(cmdArgs,
-					"--user", "--collect", "--pipe",
-					"--service-type=exec", "--unit="+name)
+				prog := "systemd-run"
+				cmdArgs := append(make([]string, 0, 4+len(args)),
+					"--user", "--collect",
+					"--service-type=exec", "--unit=webtail-"+name)
 				if setup == "" && argsAreUTF8 {
 					cmdArgs = append(cmdArgs, args...)
 				} else {
 					prg, err := syntax.Quote(args[0], syntax.LangBash)
 					if err != nil {
-						return fmt.Errorf("quote %s: %w", args[0], err)
+						http.Error(w, fmt.Sprintf("quote %s: %w", args[0], err), http.StatusBadRequest)
+						return
 					}
 					cmdArgs = append(cmdArgs,
 						"/bin/bash", "-c",
-						fmt.Sprintf(
-							setup+"exec %s $(echo -n '%s' | base64 -d)",
+						setup+fmt.Sprintf(
+							"exec %s $(echo -n '%s' | base64 -d)",
 							prg, argsB64))
 				}
-			}
+				cmd := exec.CommandContext(context.Background(), prog, cmdArgs...)
+				if err := cmd.Start(); err != nil {
+					http.Error(w, fmt.Sprintf("start %s: %w", cmd.Args, err), http.StatusInternalServerError)
+					return
+				}
+				io.WriteString(w, "/follow?name="+name)
+			})
+			return httpunix.ListenAndServe(ctx, *flagListen, http.DefaultServeMux)
+		},
+	}
 
-			cmd := exec.CommandContext(context.Background(), prog, cmdArgs...)
-			var fh *os.File
-			var err error
+	type Parameters struct {
+		Args                  [][]byte
+		MacKey                []byte
+		Name, Getenv, LogFile string
+		Sleep                 time.Duration `json:",format:sec"`
+	}
+
+	FS = ff.NewFlagSet("start")
+	flagLogFile := FS.StringLong("log-file", os.ExpandEnv("$BRUNO_HOME/data/mai/log/webtail-{{.Name}}.log"), "log file")
+	flagEmails := FS.StringListLong("email", "email addresses")
+	flagGetenv := FS.StringLong("get-env", os.ExpandEnv(". ${BRUNO_HOME}/../.app_env"), "bash command to set up the environment")
+	flagSleep := FS.DurationLong("sleep", 0, "sleep before starting command")
+	flagWait := FS.BoolLong("wait", "start and wait the program to finish")
+	startCmd := ff.Command{Name: "start", Flags: FS,
+		ShortHelp: "start  program and tail output on web",
+		Usage:     "start [opts] <program> [program args]",
+		Exec: func(ctx context.Context, args []string) error {
 			if *flagLogFile == "" {
-				fh, err = os.CreateTemp("", "webtail-"+strconv.Itoa(os.Getpid())+"-*.log")
-			} else {
-				fh, err = os.OpenFile(*flagLogFile, os.O_APPEND|os.O_CREATE, 0644)
+				*flagLogFile = os.ExpandEnv("$BRUNO_HOME/data/mai/log/webtail-{{.Name}}.log")
 			}
-			if err != nil {
-				return fmt.Errorf("open log file: %w", err)
-			}
-			slog.Info("start", "prog", cmd.Args, "log", fh.Name())
-			cmd.Stdout = fh
-			cmd.Stderr = cmd.Stdout
-			mux := http.DefaultServeMux
-			done := make(chan error, 1)
 			var a [8]byte
 			n, _ := crand.Read(a[:])
-			macKey := a[:n]
-			slog.Debug("setupHandlers", "file", fh.Name())
-			if err := setupHandlers(mux, fh.Name(), macKey); err != nil {
-				return err
+			params := Parameters{
+				Name: ulid.Make().String(), Sleep: *flagSleep,
+				MacKey: a[:n], Args: make([][]byte, len(args)),
 			}
-			if err := cmd.Start(); err != nil {
-				return fmt.Errorf("start %q: %w", cmd.Args, err)
+			params.LogFile = strings.ReplaceAll(*flagLogFile, "{{.Name}}", params.Name)
+			for i, a := range args {
+				params.Args[i] = []byte(a)
 			}
-			hsh := hmac.New(sha256.New, macKey)
-			bn := filepath.Base(fh.Name())
+			hsh := hmac.New(sha256.New, params.MacKey)
+			bn := filepath.Base(params.LogFile)
 			io.WriteString(hsh, bn)
 			want := base64.URLEncoding.EncodeToString(hsh.Sum(nil))
 			addr := *flagAddr
@@ -194,6 +205,104 @@ func Main() error {
 			}
 			fmt.Println(addr + "/tail?left=&right=%3Cbr%3E&file=" + url.PathEscape(bn) + "&mac=" + want)
 
+			subCtx := ctx
+			if !*flagWait {
+				subCtx = context.Background()
+			}
+			self, err := os.Executable()
+			if err != nil {
+				return err
+			}
+			b, err := json.Marshal(params)
+			if err != nil {
+				return err
+			}
+			cmd := exec.CommandContext(subCtx, self, "run")
+			cmd.Stdin = bytes.NewReader(b)
+			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+			slog.Info("send", "params", string(b))
+			if err := cmd.Start(); err != nil || !*flagWait {
+				return err
+			}
+			return cmd.Wait()
+		},
+	}
+
+	runCmd := ff.Command{Name: "run",
+		ShortHelp: "run program and tail output on web",
+		Usage:     "run <{Parameters json}",
+		Exec: func(ctx context.Context, _ []string) error {
+			var params Parameters
+			if err := json.UnmarshalRead(os.Stdin, &params); err != nil {
+				return err
+			}
+			// slog.Info("got", "params", params)
+			var setup string
+			{
+				var buf strings.Builder
+				if params.Getenv != "" {
+					buf.WriteString(*flagGetenv)
+					buf.WriteString("; ")
+				}
+				if params.Sleep != 0 {
+					fmt.Fprintf(&buf, "sleep %.03fs; ", float64(params.Sleep)/float64(time.Second))
+				}
+				if params.LogFile != "" {
+					s, err := syntax.Quote(params.LogFile, syntax.LangBash)
+					if err != nil {
+						return fmt.Errorf("quote %s: %w", s, err)
+					}
+					buf.WriteString("exec 2>&1; exec >" + s + "; ")
+				}
+				setup = buf.String()
+			}
+
+			argsAreUTF8 := utf8.Valid(params.Args[0])
+			args := make([]string, 0, len(params.Args))
+			for i, a := range params.Args {
+				if i == 0 {
+					args = append(args, string(a))
+					continue
+				}
+				if !utf8.Valid(a) {
+					args = append(args, `"$(echo `+base64.StdEncoding.EncodeToString(a)+` | base64 -d)"`)
+					argsAreUTF8 = false
+					continue
+				}
+				s := string(a)
+				if q, err := syntax.Quote(s, syntax.LangBash); err != nil {
+					return fmt.Errorf("quote %s: %w", s, err)
+				} else {
+					s = q
+				}
+				args = append(args, s)
+			}
+			slog.Debug("go", "args", fmt.Sprintf("%q", args))
+
+			cmdArgs := append(make([]string, 0, 1+8+len(args)), "systemd-run",
+				"--user", "--collect", "--pipe",
+				"--service-type=exec", "--unit="+params.Name)
+			if setup == "" && argsAreUTF8 {
+				cmdArgs = append(cmdArgs, args...)
+			} else {
+				cmdArgs = append(cmdArgs,
+					"/bin/bash", "-c", setup+strings.Join(args, " "))
+			}
+
+			mux := http.DefaultServeMux
+			slog.Debug("setupHandlers", "file", params.LogFile)
+			if err := setupHandlers(mux, filepath.Dir(params.LogFile), params.MacKey); err != nil {
+				return err
+			}
+
+			cmd := exec.CommandContext(context.Background(), cmdArgs[0], cmdArgs[1:]...)
+			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+			slog.Info("start", "prog", fmt.Sprintf("%q", cmd.Args))
+			if err := cmd.Start(); err != nil {
+				return fmt.Errorf("start %q: %w", cmd.Args, err)
+			}
+
+			done := make(chan error, 1)
 			go func() {
 				defer close(done)
 				err := cmd.Wait()
@@ -230,7 +339,7 @@ func Main() error {
 
 	flagVersion := appFS.Bool('V', "version", "print version and exit")
 	app := ff.Command{Name: "webtail", Flags: appFS,
-		Subcommands: []*ff.Command{&serveCmd, &runCmd},
+		Subcommands: []*ff.Command{&serveCmd, &startCmd, &runCmd, &serviceCmd},
 	}
 
 	if err := app.Parse(os.Args[1:]); err != nil {
