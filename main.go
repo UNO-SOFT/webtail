@@ -111,23 +111,21 @@ func Main() error {
 				q := r.URL.Query()
 				args := append(append(make([]string, 0, 1+len(q["args"])), q.Get("program")), q["args"]...)
 				var setup string
+				var sleep time.Duration
 				{
 					var buf strings.Builder
 					if getenv := q.Get("getenv"); getenv != "" {
 						buf.WriteString(getenv)
 						buf.WriteString("; ")
 					}
-					var sleep time.Duration
-					if s := q.Get("sleep"); s != "" {
-						var err error
-						if sleep, err = time.ParseDuration(s); err != nil {
-							http.Error(w, fmt.Sprintf("parse sleep=%s: %+v", s, err), http.StatusBadRequest)
-							return
-						} else if sleep != 0 {
-							fmt.Fprintf(&buf, "sleep %.03fs; ", float64(sleep)/float64(time.Second))
-						}
-					}
 					setup = buf.String()
+				}
+				if s := q.Get("sleep"); s != "" {
+					var err error
+					if sleep, err = time.ParseDuration(s); err != nil {
+						http.Error(w, fmt.Sprintf("parse sleep=%s: %+v", s, err), http.StatusBadRequest)
+						return
+					}
 				}
 				argsAreUTF8 := utf8.Valid([]byte(args[0]))
 				var buf bytes.Buffer
@@ -150,6 +148,10 @@ func Main() error {
 				cmdArgs := append(make([]string, 0, 4+len(args)),
 					"--user", "--collect",
 					"--service-type=exec", "--unit=webtail-"+name)
+				if sleep != 0 {
+					cmdArgs = append(cmdArgs, "--timer-property=AccuracySec=1s",
+						"--on-active="+sleep.String())
+				}
 				if setup == "" && argsAreUTF8 {
 					cmdArgs = append(cmdArgs, args...)
 				} else {
@@ -184,7 +186,7 @@ func Main() error {
 		Emails                []string
 		Listen                string
 		Name, Getenv, LogFile string
-		Sleep                 time.Duration `json:",format:sec"`
+		// Sleep                 time.Duration `json:",format:sec"`
 	}
 
 	runCmd := ff.Command{Name: "run",
@@ -213,16 +215,6 @@ func Main() error {
 					buf.WriteString(params.Getenv)
 					buf.WriteString("; ")
 				}
-				if params.Sleep != 0 {
-					fmt.Fprintf(&buf, "sleep %.03fs; ", float64(params.Sleep)/float64(time.Second))
-				}
-				if params.LogFile != "" {
-					s, err := syntax.Quote(params.LogFile, syntax.LangBash)
-					if err != nil {
-						return fmt.Errorf("quote %s: %w", s, err)
-					}
-					buf.WriteString("exec 2>&1; exec >" + s + "; ")
-				}
 				setup = buf.String()
 			}
 
@@ -249,10 +241,15 @@ func Main() error {
 			slog.Debug("go", "args", fmt.Sprintf("%q", args))
 
 			cmdArgs := append(make([]string, 0, 1+8+len(args)), "systemd-run",
-				"--user", "--collect", "--wait",
+				"--user", "--collect", "-p", "StandardError=inherit",
 				"--service-type=exec", "--unit="+params.Name)
 			if params.LogFile == "" {
-				cmdArgs = append(cmdArgs, "--pipe")
+				cmdArgs = append(cmdArgs,
+					"--pipe",
+					"-p", "StandardOutput=journal",
+				)
+			} else {
+				cmdArgs = append(cmdArgs, "-p", "StandardOutput=append:"+params.LogFile)
 			}
 			if setup == "" && argsAreUTF8 {
 				cmdArgs = append(cmdArgs, args...)
@@ -328,7 +325,7 @@ func Main() error {
 			var a [8]byte
 			n, _ := crand.Read(a[:])
 			params := Parameters{
-				Name: ulid.Make().String(), Sleep: *flagSleep,
+				Name:   ulid.Make().String(),
 				Listen: *flagAddr,
 				Emails: *flagEmails, Getenv: *flagGetenv,
 				MacKey: a[:n], Args: make([][]byte, len(args)),
@@ -362,11 +359,19 @@ func Main() error {
 				return runCmd.Exec(ctx, []string{base64.StdEncoding.EncodeToString(b)})
 			}
 
-			cmd := exec.CommandContext(context.Background(),
-				"systemd-run",
+			cmdArgs := append(make([]string, 0, 10),
 				"--user", "--collect", "--no-block",
 				"--service-type=exec", "--unit=webtail-start-"+params.Name,
-				self, "run", base64.StdEncoding.EncodeToString(b))
+			)
+			if *flagSleep != 0 {
+				cmdArgs = append(cmdArgs,
+					"--timer-property=AccuracySec=1s",
+					"--on-active="+flagSleep.String())
+			}
+			cmd := exec.CommandContext(context.Background(),
+				"systemd-run", append(cmdArgs,
+					self, "run", base64.StdEncoding.EncodeToString(b),
+				)...)
 			slog.Info("send", "params", string(b), "call", cmd.Args)
 			return cmd.Run()
 		},
