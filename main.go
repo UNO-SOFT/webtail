@@ -65,12 +65,12 @@ func Main() error {
 			}
 		}
 	}
-	serve := func(ctx context.Context, hndl http.Handler) error {
-		slog.Info("Listen", "addr", *flagAddr)
-		if addr, ok := strings.CutPrefix(*flagAddr, "https://"); ok {
+	serve := func(ctx context.Context, addr string, hndl http.Handler) error {
+		slog.Info("Listen", "addr", addr)
+		if addr, ok := strings.CutPrefix(addr, "https://"); ok {
 			return http.ListenAndServeTLS(addr, *flagTLSCert, *flagTLSKey, hndl)
 		}
-		return httpunix.ListenAndServe(ctx, *flagAddr, hndl)
+		return httpunix.ListenAndServe(ctx, addr, hndl)
 	}
 
 	FS := ff.NewFlagSet("serve")
@@ -98,7 +98,7 @@ func Main() error {
 			if err := setupHandlers(mux, root, macKey); err != nil {
 				return err
 			}
-			return serve(ctx, mux)
+			return serve(ctx, *flagAddr, mux)
 		},
 	}
 
@@ -174,100 +174,43 @@ func Main() error {
 				}
 				io.WriteString(w, "/follow?name="+name)
 			})
-			return serve(ctx, http.DefaultServeMux)
+			return serve(ctx, *flagAddr, http.DefaultServeMux)
 		},
 	}
 
 	type Parameters struct {
 		Args                  [][]byte
 		MacKey                []byte
+		Emails                []string
+		Listen                string
 		Name, Getenv, LogFile string
 		Sleep                 time.Duration `json:",format:sec"`
 	}
 
-	FS = ff.NewFlagSet("start")
-	flagLogFile := FS.StringLong("log-file", os.ExpandEnv("$BRUNO_HOME/data/mai/log/webtail-{{.Name}}.log"), "log file")
-	flagEmails := FS.StringListLong("email", "email addresses")
-	flagGetenv := FS.StringLong("get-env", os.ExpandEnv(". ${BRUNO_HOME}/../.app_env"), "bash command to set up the environment")
-	flagSleep := FS.DurationLong("sleep", 0, "sleep before starting command")
-	flagWait := FS.BoolLong("wait", "start and wait the program to finish")
-	startCmd := ff.Command{Name: "start", Flags: FS,
-		ShortHelp: "start  program and tail output on web",
-		Usage:     "start [opts] <program> [program args]",
-		Exec: func(ctx context.Context, args []string) error {
-			if *flagLogFile == "" {
-				*flagLogFile = os.ExpandEnv("$BRUNO_HOME/data/mai/log/webtail-{{.Name}}.log")
-			}
-			var a [8]byte
-			n, _ := crand.Read(a[:])
-			params := Parameters{
-				Name: ulid.Make().String(), Sleep: *flagSleep,
-				MacKey: a[:n], Args: make([][]byte, len(args)),
-			}
-			params.LogFile = strings.ReplaceAll(*flagLogFile, "{{.Name}}", params.Name)
-			for i, a := range args {
-				params.Args[i] = []byte(a)
-			}
-			hsh := hmac.New(sha256.New, params.MacKey)
-			bn := filepath.Base(params.LogFile)
-			io.WriteString(hsh, bn)
-			want := base64.URLEncoding.EncodeToString(hsh.Sum(nil))
-			addr := *flagAddr
-			if strings.HasPrefix(addr, ":") {
-				addr = "http://localhost" + addr
-			}
-			fmt.Println(addr + "/tail?left=&right=%3Cbr%3E&file=" + url.PathEscape(bn) + "&mac=" + want)
-
-			subCtx := ctx
-			if !*flagWait {
-				subCtx = context.Background()
-			}
-			self, err := os.Executable()
-			if err != nil {
-				return err
-			}
-			b, err := json.Marshal(params)
-			if err != nil {
-				return err
-			}
-			cmd := exec.CommandContext(subCtx, self, "run")
-			cmd.Stdin = bytes.NewReader(b)
-			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-			slog.Info("send", "params", string(b))
-			if !*flagWait {
-				cmd.SysProcAttr = &syscall.SysProcAttr{
-					Setpgid: true,
-					Pgid:    0,
-				}
-			}
-			if err := cloexec.SetNetConnections("tcp"); err != nil {
-				slog.Warn("cloexec.SetNetConnections", "error", err)
-			}
-			if err := cmd.Start(); err != nil {
-				return err
-			} else if !*flagWait {
-				time.Sleep(100 * time.Millisecond)
-				// slog.Info("return")
-				return nil
-			}
-			return cmd.Wait()
-		},
-	}
-
 	runCmd := ff.Command{Name: "run",
 		ShortHelp: "run program and tail output on web",
-		Usage:     "run <{Parameters json}",
-		Exec: func(ctx context.Context, _ []string) error {
+		Usage:     "run {Parameters json base64}",
+		Exec: func(ctx context.Context, args []string) error {
 			var params Parameters
-			if err := json.UnmarshalRead(os.Stdin, &params); err != nil {
-				return err
+			{
+				var buf bytes.Buffer
+				for _, a := range args {
+					b, err := base64.StdEncoding.DecodeString(a)
+					if err != nil {
+						return err
+					}
+					buf.Write(b)
+				}
+				if err := json.Unmarshal(buf.Bytes(), &params); err != nil {
+					return err
+				}
 			}
 			// slog.Info("got", "params", params)
 			var setup string
 			{
 				var buf strings.Builder
 				if params.Getenv != "" {
-					buf.WriteString(*flagGetenv)
+					buf.WriteString(params.Getenv)
 					buf.WriteString("; ")
 				}
 				if params.Sleep != 0 {
@@ -284,7 +227,7 @@ func Main() error {
 			}
 
 			argsAreUTF8 := utf8.Valid(params.Args[0])
-			args := make([]string, 0, len(params.Args))
+			args = make([]string, 0, len(params.Args))
 			for i, a := range params.Args {
 				if i == 0 {
 					args = append(args, string(a))
@@ -306,7 +249,7 @@ func Main() error {
 			slog.Debug("go", "args", fmt.Sprintf("%q", args))
 
 			cmdArgs := append(make([]string, 0, 1+8+len(args)), "systemd-run",
-				"--user", "--collect",
+				"--user", "--collect", "--wait",
 				"--service-type=exec", "--unit="+params.Name)
 			if params.LogFile == "" {
 				cmdArgs = append(cmdArgs, "--pipe")
@@ -340,7 +283,7 @@ func Main() error {
 				err := cmd.Wait()
 				done <- err
 				slog.Warn("finished", "error", err)
-				if len(*flagEmails) == 0 {
+				if len(params.Emails) == 0 {
 					return
 				}
 				var typ string
@@ -355,9 +298,9 @@ func Main() error {
 					}
 				}
 				mail := exec.CommandContext(ctx, "mail",
-					append(append(make([]string, 0, 2+len(*flagEmails)),
+					append(append(make([]string, 0, 2+len(params.Emails)),
 						"-s", strings.Join(args, " ")+" "+typ+" lefutott"),
-						*flagEmails...)...)
+						params.Emails...)...)
 				mail.Stdin = strings.NewReader(
 					strings.Join(cmd.Args, " ") + ": " + strconv.Itoa(rc))
 				mail.Stdout, mail.Stderr = os.Stdout, os.Stderr
@@ -365,7 +308,67 @@ func Main() error {
 					slog.Error("sending mail", "cmd", mail.Args, "error", err)
 				}
 			}()
-			return serve(ctx, mux)
+			return serve(ctx, params.Listen, mux)
+		},
+	}
+
+	FS = ff.NewFlagSet("start")
+	flagLogFile := FS.StringLong("log-file", os.ExpandEnv("$BRUNO_HOME/data/mai/log/webtail-{{.Name}}.log"), "log file")
+	flagEmails := FS.StringListLong("email", "email addresses")
+	flagGetenv := FS.StringLong("get-env", os.ExpandEnv(". ${BRUNO_HOME}/../.app_env"), "bash command to set up the environment")
+	flagSleep := FS.DurationLong("sleep", 0, "sleep before starting command")
+	flagWait := FS.BoolLong("wait", "start and wait the program to finish")
+	startCmd := ff.Command{Name: "start", Flags: FS,
+		ShortHelp: "start  program and tail output on web",
+		Usage:     "start [opts] <program> [program args]",
+		Exec: func(ctx context.Context, args []string) error {
+			if *flagLogFile == "" {
+				*flagLogFile = os.ExpandEnv("$BRUNO_HOME/data/mai/log/webtail-{{.Name}}.log")
+			}
+			var a [8]byte
+			n, _ := crand.Read(a[:])
+			params := Parameters{
+				Name: ulid.Make().String(), Sleep: *flagSleep,
+				Listen: *flagAddr,
+				Emails: *flagEmails, Getenv: *flagGetenv,
+				MacKey: a[:n], Args: make([][]byte, len(args)),
+			}
+			params.LogFile = strings.ReplaceAll(*flagLogFile, "{{.Name}}", params.Name)
+			for i, a := range args {
+				params.Args[i] = []byte(a)
+			}
+			hsh := hmac.New(sha256.New, params.MacKey)
+			bn := filepath.Base(params.LogFile)
+			io.WriteString(hsh, bn)
+			want := base64.URLEncoding.EncodeToString(hsh.Sum(nil))
+			addr := *flagAddr
+			if strings.HasPrefix(addr, ":") {
+				addr = "http://localhost" + addr
+			}
+			fmt.Println(addr + "/tail?left=&right=%3Cbr%3E&file=" + url.PathEscape(bn) + "&mac=" + want)
+
+			self, err := os.Executable()
+			if err != nil {
+				return err
+			}
+			b, err := json.Marshal(params)
+			if err != nil {
+				return err
+			}
+			if err := cloexec.SetNetConnections("tcp"); err != nil {
+				slog.Warn("cloexec.SetNetConnections", "error", err)
+			}
+			if *flagWait {
+				return runCmd.Exec(ctx, []string{base64.StdEncoding.EncodeToString(b)})
+			}
+
+			cmd := exec.CommandContext(context.Background(),
+				"systemd-run",
+				"--user", "--collect", "--no-block",
+				"--service-type=exec", "--unit=webtail-start-"+params.Name,
+				self, "run", base64.StdEncoding.EncodeToString(b))
+			slog.Info("send", "params", string(b), "call", cmd.Args)
+			return cmd.Run()
 		},
 	}
 
