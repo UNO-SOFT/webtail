@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -65,7 +66,8 @@ func Main() error {
 			}
 		}
 	}
-	serve := func(ctx context.Context, addr string, hndl http.Handler) error {
+	serve := func(ctx context.Context, hndl http.Handler) error {
+		addr := *flagAddr
 		slog.Info("Listen", "addr", addr)
 		if addr, ok := strings.CutPrefix(addr, "https://"); ok {
 			return http.ListenAndServeTLS(addr, *flagTLSCert, *flagTLSKey, hndl)
@@ -98,7 +100,7 @@ func Main() error {
 			if err := setupHandlers(mux, root, macKey); err != nil {
 				return err
 			}
-			return serve(ctx, *flagAddr, mux)
+			return serve(ctx, mux)
 		},
 	}
 
@@ -176,20 +178,26 @@ func Main() error {
 				}
 				io.WriteString(w, "/follow?name="+name)
 			})
-			return serve(ctx, *flagAddr, http.DefaultServeMux)
+			return serve(ctx, http.DefaultServeMux)
 		},
 	}
 
 	type Parameters struct {
-		Args                  [][]byte `json:"format:base64"`
-		MacKey                []byte   `json:"format:hex"`
-		Emails                []string
-		Listen                string
-		Name, Getenv, LogFile string
-		// Sleep                 time.Duration `json:",format:sec"`
+		Args   [][]byte `json:"format:base64"`
+		MacKey []byte   `json:"format:hex"`
+		Name   string
 	}
 
-	runCmd := ff.Command{Name: "run",
+	startFS := ff.NewFlagSet("start")
+	flagLogFile := startFS.StringLong("log-file", os.ExpandEnv("$BRUNO_HOME/data/mai/log/webtail-{{.Name}}.log"), "log file")
+	flagEmails := startFS.StringListLong("email", "email addresses")
+	flagGetenv := startFS.StringLong("get-env", os.ExpandEnv(". $BRUNO_HOME/../.app_env"), "bash command to set up the environment")
+	flagSleep := startFS.DurationLong("sleep", 0, "sleep before starting command")
+	flagWait := startFS.BoolLong("wait", "start and wait the program to finish")
+	flagRemainAfterExit := startFS.DurationLong("remain-after-exit", time.Hour, "remain serving the log file this amount of time after the program has finished running")
+	FS = ff.NewFlagSet("run")
+	FS.SetParent(startFS)
+	runCmd := ff.Command{Name: "run", Flags: FS,
 		ShortHelp: "run program and tail output on web",
 		Usage:     "run {Parameters json base64} or {json in stdin}",
 		Exec: func(ctx context.Context, args []string) error {
@@ -215,8 +223,8 @@ func Main() error {
 			var setup string
 			{
 				var buf strings.Builder
-				if params.Getenv != "" {
-					buf.WriteString(params.Getenv)
+				if *flagGetenv != "" {
+					buf.WriteString(*flagGetenv)
 					buf.WriteString("; ")
 				}
 				setup = buf.String()
@@ -247,13 +255,14 @@ func Main() error {
 			cmdArgs := append(make([]string, 0, 1+11+len(args)), "systemd-run",
 				"--user", "--collect", "-p", "StandardError=inherit",
 				"--service-type=exec", "--unit="+params.Name)
-			if params.LogFile == "" {
+			if *flagLogFile == "" {
 				cmdArgs = append(cmdArgs,
 					"--pipe",
 					"-p", "StandardOutput=journal",
 				)
 			} else {
-				cmdArgs = append(cmdArgs, "-p", "StandardOutput=append:"+params.LogFile)
+				cmdArgs = append(cmdArgs,
+					"-p", "StandardOutput=append:"+*flagLogFile)
 			}
 			if setup == "" && argsAreUTF8 {
 				cmdArgs = append(cmdArgs, args...)
@@ -263,8 +272,8 @@ func Main() error {
 			}
 
 			mux := http.DefaultServeMux
-			slog.Debug("setupHandlers", "file", params.LogFile)
-			if err := setupHandlers(mux, filepath.Dir(params.LogFile), params.MacKey); err != nil {
+			slog.Debug("setupHandlers", "file", *flagLogFile)
+			if err := setupHandlers(mux, filepath.Dir(*flagLogFile), params.MacKey); err != nil {
 				return err
 			}
 
@@ -278,13 +287,16 @@ func Main() error {
 				return fmt.Errorf("start %q: %w", cmd.Args, err)
 			}
 
-			done := make(chan error, 1)
-			go func() {
-				defer close(done)
+			done := make(chan error, 2)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			var wg sync.WaitGroup
+			wg.Go(func() {
 				err := cmd.Wait()
+				time.AfterFunc(*flagRemainAfterExit, cancel)
 				done <- err
-				slog.Warn("finished", "error", err)
-				if len(params.Emails) == 0 {
+				slog.Warn("finished", "error", err, "emails", *flagEmails)
+				if len(*flagEmails) == 0 {
 					return
 				}
 				var typ string
@@ -299,27 +311,23 @@ func Main() error {
 					}
 				}
 				mail := exec.CommandContext(ctx, "mail",
-					append(append(make([]string, 0, 2+len(params.Emails)),
+					append(append(make([]string, 0, 2+len(*flagEmails)),
 						"-s", strings.Join(args, " ")+" "+typ+" lefutott"),
-						params.Emails...)...)
+						*flagEmails...)...)
 				mail.Stdin = strings.NewReader(
 					strings.Join(cmd.Args, " ") + ": " + strconv.Itoa(rc))
-				mail.Stdout, mail.Stderr = os.Stdout, os.Stderr
-				if err := mail.Start(); err != nil {
-					slog.Error("sending mail", "cmd", mail.Args, "error", err)
+				slog.Info("mail", "cmd", mail.Args)
+				if b, err := mail.CombinedOutput(); err != nil {
+					slog.Error("sending mail", "cmd", mail.Args, "error", err, "output", string(b))
 				}
-			}()
-			return serve(ctx, params.Listen, mux)
+			})
+			wg.Go(func() { done <- serve(ctx, mux) })
+			wg.Wait()
+			return <-done
 		},
 	}
 
-	FS = ff.NewFlagSet("start")
-	flagLogFile := FS.StringLong("log-file", os.ExpandEnv("$BRUNO_HOME/data/mai/log/webtail-{{.Name}}.log"), "log file")
-	flagEmails := FS.StringListLong("email", "email addresses")
-	flagGetenv := FS.StringLong("get-env", os.ExpandEnv(". ${BRUNO_HOME}/../.app_env"), "bash command to set up the environment")
-	flagSleep := FS.DurationLong("sleep", 0, "sleep before starting command")
-	flagWait := FS.BoolLong("wait", "start and wait the program to finish")
-	startCmd := ff.Command{Name: "start", Flags: FS,
+	startCmd := ff.Command{Name: "start", Flags: startFS,
 		ShortHelp: "start  program and tail output on web",
 		Usage:     "start [opts] <program> [program args]",
 		Exec: func(ctx context.Context, args []string) error {
@@ -330,16 +338,14 @@ func Main() error {
 			n, _ := crand.Read(a[:])
 			params := Parameters{
 				Name:   ulid.Make().String(),
-				Listen: *flagAddr,
-				Emails: *flagEmails, Getenv: *flagGetenv,
 				MacKey: a[:n], Args: make([][]byte, len(args)),
 			}
-			params.LogFile = strings.ReplaceAll(*flagLogFile, "{{.Name}}", params.Name)
+			*flagLogFile = strings.ReplaceAll(*flagLogFile, "{{.Name}}", params.Name)
 			for i, a := range args {
 				params.Args[i] = []byte(a)
 			}
 			hsh := hmac.New(sha256.New, params.MacKey)
-			bn := filepath.Base(params.LogFile)
+			bn := filepath.Base(*flagLogFile)
 			io.WriteString(hsh, bn)
 			want := base64.URLEncoding.EncodeToString(hsh.Sum(nil))
 			addr := *flagAddr
@@ -363,7 +369,7 @@ func Main() error {
 				return runCmd.Exec(ctx, []string{base64.StdEncoding.EncodeToString(b)})
 			}
 
-			cmdArgs := append(make([]string, 0, 11),
+			cmdArgs := append(make([]string, 0, 15+len(*flagEmails)),
 				"--user", "--collect", "--no-block",
 				"--service-type=exec", "--unit=webtail-start-"+params.Name,
 				"-p", "StandardInputData="+base64.StdEncoding.EncodeToString(b),
@@ -373,10 +379,16 @@ func Main() error {
 					"--timer-property=AccuracySec=1s",
 					"--on-active="+flagSleep.String())
 			}
+			cmdArgs = append(cmdArgs,
+				self, "--listen", *flagAddr, "run",
+				"--log-file", *flagLogFile,
+				"--get-env", *flagGetenv,
+			)
+			for _, e := range *flagEmails {
+				cmdArgs = append(cmdArgs, "--email", e)
+			}
 			cmd := exec.CommandContext(context.Background(),
-				"systemd-run", append(cmdArgs,
-					self, "run",
-				)...)
+				"systemd-run", cmdArgs...)
 			slog.Info("send", "params", string(b), "call", cmd.Args)
 			return cmd.Run()
 		},
