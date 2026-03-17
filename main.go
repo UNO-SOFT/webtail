@@ -181,8 +181,8 @@ func Main() error {
 	}
 
 	type Parameters struct {
-		Args                  [][]byte
-		MacKey                []byte
+		Args                  [][]byte `json:"format:base64"`
+		MacKey                []byte   `json:"format:hex"`
 		Emails                []string
 		Listen                string
 		Name, Getenv, LogFile string
@@ -191,10 +191,14 @@ func Main() error {
 
 	runCmd := ff.Command{Name: "run",
 		ShortHelp: "run program and tail output on web",
-		Usage:     "run {Parameters json base64}",
+		Usage:     "run {Parameters json base64} or {json in stdin}",
 		Exec: func(ctx context.Context, args []string) error {
 			var params Parameters
-			{
+			if len(args) == 0 || args[0] == "" || args[0] == "-" {
+				if err := json.UnmarshalRead(os.Stdin, &params); err != nil {
+					return err
+				}
+			} else {
 				var buf bytes.Buffer
 				for _, a := range args {
 					b, err := base64.StdEncoding.DecodeString(a)
@@ -240,7 +244,7 @@ func Main() error {
 			}
 			slog.Debug("go", "args", fmt.Sprintf("%q", args))
 
-			cmdArgs := append(make([]string, 0, 1+8+len(args)), "systemd-run",
+			cmdArgs := append(make([]string, 0, 1+11+len(args)), "systemd-run",
 				"--user", "--collect", "-p", "StandardError=inherit",
 				"--service-type=exec", "--unit="+params.Name)
 			if params.LogFile == "" {
@@ -359,9 +363,10 @@ func Main() error {
 				return runCmd.Exec(ctx, []string{base64.StdEncoding.EncodeToString(b)})
 			}
 
-			cmdArgs := append(make([]string, 0, 10),
+			cmdArgs := append(make([]string, 0, 11),
 				"--user", "--collect", "--no-block",
 				"--service-type=exec", "--unit=webtail-start-"+params.Name,
+				"-p", "StandardInputData="+base64.StdEncoding.EncodeToString(b),
 			)
 			if *flagSleep != 0 {
 				cmdArgs = append(cmdArgs,
@@ -370,7 +375,7 @@ func Main() error {
 			}
 			cmd := exec.CommandContext(context.Background(),
 				"systemd-run", append(cmdArgs,
-					self, "run", base64.StdEncoding.EncodeToString(b),
+					self, "run",
 				)...)
 			slog.Info("send", "params", string(b), "call", cmd.Args)
 			return cmd.Run()
